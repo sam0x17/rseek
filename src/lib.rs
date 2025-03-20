@@ -2,7 +2,6 @@ use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::u64;
 
 use bytes::{Buf, Bytes};
 use futures::future::BoxFuture;
@@ -24,7 +23,7 @@ impl<F> Seekable<F>
 where
     F: Fn() -> RequestBuilder + Send + Sync + 'static,
 {
-    pub async fn new(request_builder_factory: F) -> IoResult<Self> {
+    pub async fn new(request_builder_factory: F) -> Self {
         let mut instance = Self {
             request_builder_factory,
             file_size: None,
@@ -34,14 +33,36 @@ where
         };
 
         // Fetch and store file size
-        instance.file_size = Some(instance.fetch_file_size().await?);
+        instance.file_size = match instance.fetch_file_size().await {
+            Ok(size) => Some(size),
+            _ => None,
+        };
 
-        Ok(instance)
+        instance
     }
 
     fn start_fetch(&mut self, range: Range<u64>) {
-        let request = (self.request_builder_factory)()
-            .header("Range", format!("bytes={}-{}", range.start, range.end - 1));
+        let (start, end) = if let Some(file_size) = self.file_size {
+            if range.start >= file_size {
+                // Trying to read past EOF
+                self.pending_fetch = Some(Box::pin(async { Ok(Bytes::new()) }));
+                return;
+            }
+
+            // Adjust range to avoid reading past EOF
+            let end = range.end.min(file_size);
+            if end <= range.start {
+                return;
+            }
+
+            (range.start, end - 1)
+        } else {
+            // No known file size, just request the full range trusting the server
+            (range.start, range.end - 1)
+        };
+
+        let request =
+            (self.request_builder_factory)().header("Range", format!("bytes={}-{}", start, end));
 
         let fetch_future = async move {
             let response = request
@@ -49,10 +70,16 @@ where
                 .await
                 .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
 
-            response
+            let body = response
                 .bytes()
                 .await
-                .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))
+                .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
+
+            if body.is_empty() {
+                return Ok(Bytes::new());
+            }
+
+            Ok(body)
         };
 
         self.pending_fetch = Some(Box::pin(fetch_future));
@@ -67,11 +94,10 @@ where
             .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
 
         if !response.status().is_success() {
-            return Ok(u64::MAX);
-            // return Err(IoError::new(
-            //     ErrorKind::Other,
-            //     format!("Unexpected response status: {}", response.status()),
-            // ));
+            return Err(IoError::new(
+                ErrorKind::Other,
+                format!("Unexpected response status: {}", response.status()),
+            ));
         }
 
         if let Some(content_range) = response.headers().get("content-range") {
@@ -105,17 +131,25 @@ where
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<IoResult<()>> {
-        let this = self.get_mut(); // Fix mutable borrowing
+        let this = self.get_mut();
+
+        // If we're past EOF, return EOF error
+        if let Some(file_size) = this.file_size {
+            if this.position >= file_size {
+                return Poll::Ready(Err(IoError::new(ErrorKind::UnexpectedEof, "EOF reached")));
+            }
+        }
 
         if this.buffer.is_empty() {
             if this.pending_fetch.is_none() {
-                let range = this.position..this.position + 8192;
-                this.start_fetch(range);
+                let fetch_size = 8192;
+                let end = this.position + fetch_size;
+
+                this.start_fetch(this.position..end);
             }
 
             if let Some(future) = &mut this.pending_fetch {
-                let poll_result: Poll<IoResult<Bytes>> = Pin::new(future).poll(cx);
-                match poll_result {
+                match Pin::new(future).poll(cx) {
                     Poll::Ready(Ok(bytes)) => {
                         this.buffer = bytes;
                         this.pending_fetch = None;
@@ -126,8 +160,10 @@ where
             }
         }
 
-        if this.buffer.is_empty() {
-            return Poll::Ready(Err(IoError::new(ErrorKind::UnexpectedEof, "EOF reached")));
+        if let Some(file_size) = this.file_size {
+            if this.buffer.is_empty() && file_size > 0 {
+                return Poll::Ready(Err(IoError::new(ErrorKind::UnexpectedEof, "EOF reached")));
+            }
         }
 
         let to_copy = buf.remaining().min(this.buffer.len());
@@ -144,7 +180,7 @@ where
     F: Fn() -> RequestBuilder + Send + Sync + 'static + Unpin,
 {
     fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> IoResult<()> {
-        let this = self.get_mut(); // Fix mutable borrowing
+        let this = self.get_mut();
 
         this.position = match position {
             SeekFrom::Start(pos) => pos,
@@ -174,6 +210,10 @@ where
             }
         };
 
+        if let Some(file_size) = this.file_size {
+            this.position = this.position.min(file_size);
+        }
+
         this.buffer = Bytes::new();
         this.pending_fetch = None;
 
@@ -181,11 +221,10 @@ where
     }
 
     fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<u64>> {
-        let this = self.get_mut(); // Fix mutable borrowing
+        let this = self.get_mut();
 
         if let Some(future) = &mut this.pending_fetch {
-            let poll_result: Poll<IoResult<Bytes>> = Pin::new(future).poll(cx);
-            match poll_result {
+            match Pin::new(future).poll(cx) {
                 Poll::Ready(Ok(bytes)) => {
                     this.buffer = bytes;
                     this.pending_fetch = None;
@@ -207,9 +246,7 @@ async fn test_seekable_http_stream() {
 
     let client = Client::new();
 
-    let mut stream = Seekable::new(move || client.get("https://example.com/largefile.bin"))
-        .await
-        .unwrap();
+    let mut stream = Seekable::new(move || client.get("https://example.com/largefile.bin")).await;
 
     let mut buf = vec![0u8; 16]; // Read 16 bytes
 
@@ -244,9 +281,7 @@ async fn test_fetch_file_size_ovh() {
     use reqwest::Client;
 
     let client = Client::new();
-    let stream = Seekable::new(move || client.get("https://proof.ovh.net/files/100Mb.dat"))
-        .await
-        .unwrap();
+    let stream = Seekable::new(move || client.get("https://proof.ovh.net/files/100Mb.dat")).await;
 
     let size = Seekable::fetch_file_size(&stream).await.unwrap();
 
@@ -261,11 +296,97 @@ async fn test_fetch_file_size_of1() {
     let client = Client::new();
 
     let stream =
-        Seekable::new(move || client.get("https://files.old-faithful.net/712/epoch-712.car"))
-            .await
-            .unwrap();
+        Seekable::new(move || client.get("https://files.old-faithful.net/712/epoch-712.car")).await;
 
     let size = Seekable::fetch_file_size(&stream).await.unwrap();
 
     assert_eq!(size, 781436491980);
+}
+
+#[tokio::test]
+async fn test_seek_beyond_eof() {
+    use reqwest::Client;
+    use tokio::io::AsyncSeekExt;
+
+    let client = Client::new();
+    let mut stream =
+        Seekable::new(move || client.get("https://proof.ovh.net/files/100Mb.dat")).await;
+
+    let file_size = stream.file_size.unwrap();
+
+    // Seek well beyond EOF
+    stream
+        .seek(SeekFrom::Start(file_size + 1000))
+        .await
+        .unwrap();
+
+    // Ensure position is clamped to EOF
+    assert_eq!(stream.position, file_size);
+}
+
+#[tokio::test]
+async fn test_read_at_eof_should_return_eof() {
+    use reqwest::Client;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+
+    let client = Client::new();
+    let mut stream =
+        Seekable::new(move || client.get("https://proof.ovh.net/files/100Mb.dat")).await;
+
+    let file_size = stream.file_size.unwrap();
+
+    // Seek to EOF
+    stream.seek(SeekFrom::Start(file_size)).await.unwrap();
+
+    let mut buf = vec![0u8; 16];
+    let result = stream.read_exact(&mut buf).await;
+
+    // Expect EOF error
+    assert!(result.is_err());
+    assert_eq!(
+        result.unwrap_err().kind(),
+        std::io::ErrorKind::UnexpectedEof
+    );
+}
+
+#[tokio::test]
+async fn test_fetch_near_eof_should_only_fetch_remaining_bytes() {
+    use reqwest::Client;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+
+    let client = Client::new();
+    let mut stream =
+        Seekable::new(move || client.get("https://proof.ovh.net/files/100Mb.dat")).await;
+
+    let file_size = stream.file_size.unwrap();
+
+    // Seek close to EOF
+    stream.seek(SeekFrom::Start(file_size - 10)).await.unwrap();
+
+    let mut buf = vec![0u8; 16]; // Try to read past EOF
+    let result = stream.read_exact(&mut buf).await;
+
+    // Expect an EOF error because there's not enough data to fill the buffer
+    assert!(result.is_err());
+    assert_eq!(
+        result.unwrap_err().kind(),
+        std::io::ErrorKind::UnexpectedEof
+    );
+}
+
+#[tokio::test]
+async fn test_seek_before_start_should_error() {
+    use reqwest::Client;
+    use tokio::io::AsyncSeekExt;
+
+    let client = Client::new();
+    let mut stream =
+        Seekable::new(move || client.get("https://proof.ovh.net/files/100Mb.dat")).await;
+
+    // Seek to a negative position
+    let result = stream.seek(SeekFrom::Current(-1_000_000_000)).await;
+
+    // Should return an error
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
 }

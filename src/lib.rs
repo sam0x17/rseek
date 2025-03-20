@@ -121,47 +121,28 @@ where
             buffer_size,
             pending_fetch: None,
         };
-
-        // Fetch and store file size
-        instance.file_size = match instance.fetch_file_size().await {
-            Ok(size) => {
-                instance.buffer_size = buffer_size;
-                Some(size)
-            }
-            _ => None,
-        };
-
+        instance.file_size = instance.fetch_file_size().await.ok();
         instance
     }
 
     fn start_fetch(&mut self, range: Range<u64>) {
-        let (start, end) = if let Some(file_size) = self.file_size {
+        let request = if let Some(file_size) = self.file_size {
             if range.start >= file_size {
-                // Trying to read past EOF
                 self.pending_fetch = Some(Box::pin(async { Ok(Bytes::new()) }));
                 return;
             }
 
-            // Adjust range to avoid reading past EOF
             let end = range.end.min(file_size);
             if end <= range.start {
                 return;
             }
 
-            (range.start, end - 1)
+            (self.request_builder_factory)()
+                .header("Range", format!("bytes={}-{}", range.start, end - 1))
         } else {
-            // No known file size, just request the full range trusting the server
-            if range.end > 0 {
-                // Adjust range to avoid reading past EOF
-                (range.start, range.end - 1)
-            } else {
-                // Read from start to end
-                (range.start, range.end)
-            }
+            // No file size known, use open-ended range request
+            (self.request_builder_factory)().header("Range", format!("bytes={}-", range.start))
         };
-
-        let request =
-            (self.request_builder_factory)().header("Range", format!("bytes={}-{}", start, end));
 
         let fetch_future = async move {
             let response = request

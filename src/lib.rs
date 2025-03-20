@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes};
+use futures::future::BoxFuture;
 use reqwest::RequestBuilder;
 use tokio::io::{AsyncRead, AsyncSeek, SeekFrom};
 
@@ -11,6 +12,7 @@ pub struct Seekable {
     request_template: RequestBuilder, // Store the original request to clone from
     position: u64,
     buffer: Bytes,
+    pending_fetch: Option<BoxFuture<'static, IoResult<Bytes>>>, // Fetching in progress
 }
 
 impl Seekable {
@@ -23,36 +25,60 @@ impl Seekable {
             request_template,
             position: 0,
             buffer: Bytes::new(),
+            pending_fetch: None,
         })
     }
 
-    async fn fetch_range(&mut self, range: Range<u64>) -> IoResult<Bytes> {
-        let range_header = format!("bytes={}-{}", range.start, range.end - 1);
-
+    fn start_fetch(&mut self, range: Range<u64>) {
         let request = self
             .request_template
             .try_clone()
-            .ok_or_else(|| IoError::new(ErrorKind::Other, "Failed to clone request template"))?
-            .header("Range", range_header);
+            .ok_or_else(|| IoError::new(ErrorKind::Other, "Failed to clone request template"));
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
+        let fetch_future = async move {
+            let request = request?;
+            let response = request
+                .header("Range", format!("bytes={}-{}", range.start, range.end - 1))
+                .send()
+                .await
+                .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
 
-        Ok(response
-            .bytes()
-            .await
-            .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?)
+            response
+                .bytes()
+                .await
+                .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))
+        };
+
+        self.pending_fetch = Some(Box::pin(fetch_future));
     }
 }
 
 impl AsyncRead for Seekable {
     fn poll_read(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<IoResult<()>> {
+        // If buffer is empty, start fetching more data
+        if self.buffer.is_empty() {
+            if self.pending_fetch.is_none() {
+                let range = self.position..self.position + 8192;
+                self.start_fetch(range);
+            }
+
+            // Poll future if it's still pending
+            if let Some(future) = &mut self.pending_fetch {
+                match Pin::new(future).poll(cx) {
+                    Poll::Ready(Ok(bytes)) => {
+                        self.buffer = bytes;
+                        self.pending_fetch = None;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+
         if self.buffer.is_empty() {
             return Poll::Ready(Err(IoError::new(ErrorKind::UnexpectedEof, "EOF reached")));
         }
@@ -76,22 +102,38 @@ impl AsyncSeek for Seekable {
                     "Seek from end not supported",
                 ));
             }
-            SeekFrom::Current(offset) => (self.position as i64 + offset) as u64,
+            SeekFrom::Current(offset) => {
+                let new_pos = self.position as i64 + offset;
+                if new_pos < 0 {
+                    return Err(IoError::new(
+                        ErrorKind::InvalidInput,
+                        "Negative seek position",
+                    ));
+                }
+                new_pos as u64
+            }
         };
+
+        // Invalidate buffer and fetch new range
+        self.buffer = Bytes::new();
+        self.pending_fetch = None;
 
         Ok(())
     }
 
-    fn poll_complete(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<IoResult<u64>> {
-        let new_range = self.position..self.position + 8192;
-        let future = self.fetch_range(new_range);
-
-        match futures::executor::block_on(future) {
-            Ok(bytes) => {
-                self.buffer = bytes;
-                Poll::Ready(Ok(self.position))
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<u64>> {
+        if let Some(future) = &mut self.pending_fetch {
+            match Pin::new(future).poll(cx) {
+                Poll::Ready(Ok(bytes)) => {
+                    self.buffer = bytes;
+                    self.pending_fetch = None;
+                    return Poll::Ready(Ok(self.position));
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
-            Err(e) => Poll::Ready(Err(e)),
         }
+
+        Poll::Ready(Ok(self.position))
     }
 }

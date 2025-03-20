@@ -51,6 +51,49 @@ impl Seekable {
 
         self.pending_fetch = Some(Box::pin(fetch_future));
     }
+
+    /// Fetches the total file size by making a request with `Range: bytes=0-0`
+    async fn fetch_file_size(request: &RequestBuilder) -> IoResult<u64> {
+        let request = request
+            .try_clone()
+            .ok_or_else(|| IoError::new(ErrorKind::Other, "Failed to clone request"))?;
+
+        let response = request
+            .header("Range", "bytes=0-0")
+            .send()
+            .await
+            .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
+
+        // Ensure the response is successful (200 OK or 206 Partial Content)
+        if !response.status().is_success() {
+            return Err(IoError::new(
+                ErrorKind::Other,
+                format!("Unexpected response status: {}", response.status()),
+            ));
+        }
+
+        // Try `Content-Range` first
+        if let Some(content_range) = response.headers().get("content-range") {
+            let content_range = content_range.to_str().unwrap_or("");
+            if let Some(size_str) = content_range.split('/').nth(1) {
+                if let Ok(size) = size_str.parse::<u64>() {
+                    return Ok(size);
+                }
+            }
+        }
+
+        // Fallback to `Content-Length`
+        if let Some(content_length) = response.headers().get("Content-Length") {
+            if let Ok(size) = content_length.to_str().unwrap_or("").parse::<u64>() {
+                return Ok(size);
+            }
+        }
+
+        Err(IoError::new(
+            ErrorKind::Other,
+            "Failed to determine file size",
+        ))
+    }
 }
 
 impl AsyncRead for Seekable {
@@ -178,4 +221,27 @@ async fn test_seekable_http_stream() -> std::io::Result<()> {
     println!("Seek test passed!");
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_fetch_file_size() {
+    use reqwest::Client;
+
+    let client = Client::new();
+    let request = client.get("https://proof.ovh.net/files/100Mb.dat");
+
+    let size = Seekable::fetch_file_size(&request).await.unwrap();
+
+    // Assert that file size is exactly 100MB (104857600 bytes)
+    assert_eq!(size, 100 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn test_fetch_file_size_failure() {
+    use reqwest::Client;
+
+    let client = Client::new();
+    let request = client.get("https://proof.ovh.net/files/nonexistent.dat");
+
+    Seekable::fetch_file_size(&request).await.unwrap_err();
 }

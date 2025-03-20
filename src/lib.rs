@@ -38,7 +38,7 @@ const BUFFER_SIZE: u64 = 262144;
 ///
 /// #[tokio::main]
 /// async fn main() {
-/// 	use rseek::Seekable;
+///     use rseek::Seekable;
 ///     let client = Client::new();
 ///     let mut stream = Seekable::new(move || client.get("https://example.com/largefile.bin")).await;
 ///

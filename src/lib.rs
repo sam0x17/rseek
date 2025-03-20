@@ -339,17 +339,21 @@ where
 pub const fn ideal_buffer_size(file_size: u64) -> u64 {
     // 1 MB
     if file_size < 1024 * 1024 {
-        return 8192; // 8 KB
+        // 8 KB
+        return 8192;
     }
     // 10 MB
     if file_size < 1024 * 1024 * 10 {
-        return 65536; // 64 KB
+        // 64 KB
+        return 65536;
     }
     // 1 GB
     if file_size < 1024 * 1024 * 1024 {
-        return 262144; // 256 KB
+        // 256 KB
+        return 262144;
     }
-    return 524288; // 512 KB
+    // 512 KB
+    524288
 }
 
 #[tokio::test]

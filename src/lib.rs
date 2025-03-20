@@ -7,13 +7,13 @@ use bytes::{Buf, Bytes};
 use reqwest::RequestBuilder;
 use tokio::io::{AsyncRead, AsyncSeek, SeekFrom};
 
-pub struct SeekableHttpStream {
+pub struct Seekable {
     request_template: RequestBuilder, // Store the original request to clone from
     position: u64,
     buffer: Bytes,
 }
 
-impl SeekableHttpStream {
+impl Seekable {
     pub fn new(request: RequestBuilder) -> IoResult<Self> {
         let request_template = request
             .try_clone()
@@ -47,7 +47,7 @@ impl SeekableHttpStream {
     }
 }
 
-impl AsyncRead for SeekableHttpStream {
+impl AsyncRead for Seekable {
     fn poll_read(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
@@ -66,7 +66,7 @@ impl AsyncRead for SeekableHttpStream {
     }
 }
 
-impl AsyncSeek for SeekableHttpStream {
+impl AsyncSeek for Seekable {
     fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> IoResult<()> {
         self.position = match position {
             SeekFrom::Start(pos) => pos,

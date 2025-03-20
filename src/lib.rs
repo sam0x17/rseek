@@ -8,7 +8,7 @@ use futures::future::BoxFuture;
 use reqwest::RequestBuilder;
 use tokio::io::{AsyncRead, AsyncSeek, SeekFrom};
 
-const BUFFER_SIZE: u64 = 8192;
+const BUFFER_SIZE: u64 = 262144;
 
 pub struct Seekable<F>
 where

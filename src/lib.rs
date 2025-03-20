@@ -16,8 +16,6 @@ use futures::future::BoxFuture;
 use reqwest::RequestBuilder;
 use tokio::io::{AsyncRead, AsyncSeek, SeekFrom};
 
-const BUFFER_SIZE: u64 = 262144;
-
 /// Provides a seekable and asynchronous read interface for [`reqwest`] HTTP streams.
 /// This is useful for handling large files over HTTP where random access is required.
 ///
@@ -71,6 +69,7 @@ where
     file_size: Option<u64>,     // Store the file size
     position: u64,
     buffer: Bytes,
+    buffer_size: u64,
     pending_fetch: Option<BoxFuture<'static, IoResult<Bytes>>>,
 }
 
@@ -93,12 +92,39 @@ where
             file_size: None,
             position: 0,
             buffer: Bytes::new(),
+            buffer_size: 0,
             pending_fetch: None,
         };
 
         // Fetch and store file size
         instance.file_size = match instance.fetch_file_size().await {
-            Ok(size) => Some(size),
+            Ok(size) => {
+                instance.buffer_size = ideal_buffer_size(size);
+                Some(size)
+            }
+            _ => None,
+        };
+
+        instance
+    }
+
+    /// Allows overriding the intelligently-calculated buffer size with a custom value. See [`Self::new`].
+    pub async fn new_with_buffer_size(request_builder_factory: F, buffer_size: u64) -> Self {
+        let mut instance = Self {
+            request_builder_factory,
+            file_size: None,
+            position: 0,
+            buffer: Bytes::new(),
+            buffer_size,
+            pending_fetch: None,
+        };
+
+        // Fetch and store file size
+        instance.file_size = match instance.fetch_file_size().await {
+            Ok(size) => {
+                instance.buffer_size = buffer_size;
+                Some(size)
+            }
             _ => None,
         };
 
@@ -122,7 +148,13 @@ where
             (range.start, end - 1)
         } else {
             // No known file size, just request the full range trusting the server
-            (range.start, range.end - 1)
+            if range.end > 0 {
+                // Adjust range to avoid reading past EOF
+                (range.start, range.end - 1)
+            } else {
+                // Read from start to end
+                (range.start, range.end)
+            }
         };
 
         let request =
@@ -206,7 +238,7 @@ where
 
         if this.buffer.is_empty() {
             if this.pending_fetch.is_none() {
-                let fetch_size = BUFFER_SIZE;
+                let fetch_size = this.buffer_size;
                 let end = this.position + fetch_size;
 
                 this.start_fetch(this.position..end);
@@ -301,6 +333,23 @@ where
 
         Poll::Ready(Ok(this.position))
     }
+}
+
+/// Default buffer size for reading data from the HTTP stream.
+pub const fn ideal_buffer_size(file_size: u64) -> u64 {
+    // 1 MB
+    if file_size < 1024 * 1024 {
+        return 8192; // 8 KB
+    }
+    // 10 MB
+    if file_size < 1024 * 1024 * 10 {
+        return 65536; // 64 KB
+    }
+    // 1 GB
+    if file_size < 1024 * 1024 * 1024 {
+        return 262144; // 256 KB
+    }
+    return 524288; // 512 KB
 }
 
 #[tokio::test]

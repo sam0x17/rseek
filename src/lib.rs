@@ -8,6 +8,8 @@ use futures::future::BoxFuture;
 use reqwest::RequestBuilder;
 use tokio::io::{AsyncRead, AsyncSeek, SeekFrom};
 
+const BUFFER_SIZE: u64 = 8192;
+
 pub struct Seekable<F>
 where
     F: Fn() -> RequestBuilder + Send + Sync + 'static,
@@ -142,7 +144,7 @@ where
 
         if this.buffer.is_empty() {
             if this.pending_fetch.is_none() {
-                let fetch_size = 8192;
+                let fetch_size = BUFFER_SIZE;
                 let end = this.position + fetch_size;
 
                 this.start_fetch(this.position..end);

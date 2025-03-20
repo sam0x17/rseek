@@ -5,6 +5,7 @@ edition = "2024"
 authors = ["sam0x17"]
 description = "rseek is an adapter for reqwest that allows seeking in the response body stream using AsyncSeek"
 keywords = ["reqwest", "seek", "async", "http"]
+license = "MIT"
 
 [dependencies]
 bytes = "1.10.1"

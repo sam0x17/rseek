@@ -10,6 +10,51 @@ use tokio::io::{AsyncRead, AsyncSeek, SeekFrom};
 
 const BUFFER_SIZE: u64 = 262144;
 
+/// Provides a seekable and asynchronous read interface for [`reqwest`] HTTP streams.
+/// This is useful for handling large files over HTTP where random access is required.
+///
+/// # Type Parameters
+/// - `F`: A closure type that generates a [`RequestBuilder`] for HTTP requests.
+///
+/// # Methods
+/// - `new`: Creates a new [`Seekable`] instance and fetches the file size if available.
+///
+/// # Traits Implemented
+/// - `AsyncRead`: Allows asynchronous reading of data from the HTTP stream.
+/// - `AsyncSeek`: Allows seeking to specific positions in the HTTP stream.
+///
+/// # Examples
+/// ```
+/// use reqwest::Client;
+/// use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+///
+/// #[tokio::main]
+/// async fn main() {
+/// 	use rseek::Seekable;
+///     let client = Client::new();
+///     let mut stream = Seekable::new(move || client.get("https://example.com/largefile.bin")).await;
+///
+///     let mut buf = vec![0u8; 16];
+///     stream.read_exact(&mut buf).await.unwrap();
+///     println!("First 16 bytes: {:?}", buf);
+///
+///     stream.seek(SeekFrom::Start(1_000_000)).await.unwrap();
+///     stream.read_exact(&mut buf).await.unwrap();
+///     println!("Bytes after seeking to 1MB: {:?}", buf);
+/// }
+/// ```
+///
+/// # Notes
+/// - This implementation assumes the server supports HTTP range requests. Servers that do not
+///   support range requests are still usable, however certain seeking features will be
+///   unavailable.
+/// - If the file size cannot be determined, the implementation will attempt to fetch data
+///   without bounds, relying on the server to handle the request appropriately.
+///
+/// # Errors
+/// - Returns `UnexpectedEof` if attempting to read past the end of the file.
+/// - Returns `InvalidInput` if seeking to a negative position.
+/// - Returns `Unsupported` if seeking from the end when the file size is unknown.
 pub struct Seekable<F>
 where
     F: Fn() -> RequestBuilder + Send + Sync + 'static,
@@ -25,6 +70,15 @@ impl<F> Seekable<F>
 where
     F: Fn() -> RequestBuilder + Send + Sync + 'static,
 {
+    /// Creates a new [`Seekable`] instance and fetches the file size if available.
+    ///
+    /// # Parameters
+    /// - `request_builder_factory`: A closure that generates a [`RequestBuilder`] for HTTP
+    ///  requests. This closure is called whenever a new HTTP request is required. The closure
+    ///  should return a [`RequestBuilder`] that is ready to be sent.
+    ///
+    /// # Returns
+    /// A new [`Seekable`] instance.
     pub async fn new(request_builder_factory: F) -> Self {
         let mut instance = Self {
             request_builder_factory,

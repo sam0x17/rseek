@@ -8,37 +8,35 @@ use futures::future::BoxFuture;
 use reqwest::RequestBuilder;
 use tokio::io::{AsyncRead, AsyncSeek, SeekFrom};
 
-pub struct Seekable {
-    request_template: RequestBuilder, // Store the original request to clone from
+pub struct Seekable<F>
+where
+    F: Fn() -> RequestBuilder + Send + Sync + 'static,
+{
+    request_builder_factory: F, // Closure to generate RequestBuilder
     position: u64,
     buffer: Bytes,
-    pending_fetch: Option<BoxFuture<'static, IoResult<Bytes>>>, // Fetching in progress
+    pending_fetch: Option<BoxFuture<'static, IoResult<Bytes>>>,
 }
 
-impl Seekable {
-    pub fn new(request: RequestBuilder) -> IoResult<Self> {
-        let request_template = request
-            .try_clone()
-            .ok_or_else(|| IoError::new(ErrorKind::Other, "Failed to clone request"))?;
-
-        Ok(Self {
-            request_template,
+impl<F> Seekable<F>
+where
+    F: Fn() -> RequestBuilder + Send + Sync + 'static,
+{
+    pub fn new(request_builder_factory: F) -> Self {
+        Self {
+            request_builder_factory,
             position: 0,
             buffer: Bytes::new(),
             pending_fetch: None,
-        })
+        }
     }
 
     fn start_fetch(&mut self, range: Range<u64>) {
-        let request = self
-            .request_template
-            .try_clone()
-            .ok_or_else(|| IoError::new(ErrorKind::Other, "Failed to clone request template"));
+        let request = (self.request_builder_factory)()
+            .header("Range", format!("bytes={}-{}", range.start, range.end - 1));
 
         let fetch_future = async move {
-            let request = request?;
             let response = request
-                .header("Range", format!("bytes={}-{}", range.start, range.end - 1))
                 .send()
                 .await
                 .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
@@ -52,19 +50,14 @@ impl Seekable {
         self.pending_fetch = Some(Box::pin(fetch_future));
     }
 
-    /// Fetches the total file size by making a request with `Range: bytes=0-0`
-    async fn fetch_file_size(request: &RequestBuilder) -> IoResult<u64> {
-        let request = request
-            .try_clone()
-            .ok_or_else(|| IoError::new(ErrorKind::Other, "Failed to clone request"))?;
+    pub async fn fetch_file_size(&self) -> IoResult<u64> {
+        let request = (self.request_builder_factory)().header("Range", "bytes=0-0");
 
         let response = request
-            .header("Range", "bytes=0-0")
             .send()
             .await
             .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
 
-        // Ensure the response is successful (200 OK or 206 Partial Content)
         if !response.status().is_success() {
             return Err(IoError::new(
                 ErrorKind::Other,
@@ -72,7 +65,6 @@ impl Seekable {
             ));
         }
 
-        // Try `Content-Range` first
         if let Some(content_range) = response.headers().get("content-range") {
             let content_range = content_range.to_str().unwrap_or("");
             if let Some(size_str) = content_range.split('/').nth(1) {
@@ -82,8 +74,7 @@ impl Seekable {
             }
         }
 
-        // Fallback to `Content-Length`
-        if let Some(content_length) = response.headers().get("Content-Length") {
+        if let Some(content_length) = response.headers().get("content-length") {
             if let Ok(size) = content_length.to_str().unwrap_or("").parse::<u64>() {
                 return Ok(size);
             }
@@ -96,25 +87,29 @@ impl Seekable {
     }
 }
 
-impl AsyncRead for Seekable {
+impl<F> AsyncRead for Seekable<F>
+where
+    F: Fn() -> RequestBuilder + Send + Sync + 'static + Unpin,
+{
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<IoResult<()>> {
-        // If buffer is empty, start fetching more data
-        if self.buffer.is_empty() {
-            if self.pending_fetch.is_none() {
-                let range = self.position..self.position + 8192;
-                self.start_fetch(range);
+        let this = self.get_mut(); // Fix mutable borrowing
+
+        if this.buffer.is_empty() {
+            if this.pending_fetch.is_none() {
+                let range = this.position..this.position + 8192;
+                this.start_fetch(range);
             }
 
-            // Poll future if it's still pending
-            if let Some(future) = &mut self.pending_fetch {
-                match Pin::new(future).poll(cx) {
+            if let Some(future) = &mut this.pending_fetch {
+                let poll_result: Poll<IoResult<Bytes>> = Pin::new(future).poll(cx);
+                match poll_result {
                     Poll::Ready(Ok(bytes)) => {
-                        self.buffer = bytes;
-                        self.pending_fetch = None;
+                        this.buffer = bytes;
+                        this.pending_fetch = None;
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => return Poll::Pending,
@@ -122,22 +117,27 @@ impl AsyncRead for Seekable {
             }
         }
 
-        if self.buffer.is_empty() {
+        if this.buffer.is_empty() {
             return Poll::Ready(Err(IoError::new(ErrorKind::UnexpectedEof, "EOF reached")));
         }
 
-        let to_copy = buf.remaining().min(self.buffer.len());
-        buf.put_slice(&self.buffer[..to_copy]);
-        self.buffer.advance(to_copy);
-        self.position += to_copy as u64;
+        let to_copy = buf.remaining().min(this.buffer.len());
+        buf.put_slice(&this.buffer[..to_copy]);
+        this.buffer.advance(to_copy);
+        this.position += to_copy as u64;
 
         Poll::Ready(Ok(()))
     }
 }
 
-impl AsyncSeek for Seekable {
-    fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> IoResult<()> {
-        self.position = match position {
+impl<F> AsyncSeek for Seekable<F>
+where
+    F: Fn() -> RequestBuilder + Send + Sync + 'static + Unpin,
+{
+    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> IoResult<()> {
+        let this = self.get_mut(); // Fix mutable borrowing
+
+        this.position = match position {
             SeekFrom::Start(pos) => pos,
             SeekFrom::End(_) => {
                 return Err(IoError::new(
@@ -146,7 +146,7 @@ impl AsyncSeek for Seekable {
                 ));
             }
             SeekFrom::Current(offset) => {
-                let new_pos = self.position as i64 + offset;
+                let new_pos = this.position as i64 + offset;
                 if new_pos < 0 {
                     return Err(IoError::new(
                         ErrorKind::InvalidInput,
@@ -157,27 +157,29 @@ impl AsyncSeek for Seekable {
             }
         };
 
-        // Invalidate buffer and fetch new range
-        self.buffer = Bytes::new();
-        self.pending_fetch = None;
+        this.buffer = Bytes::new();
+        this.pending_fetch = None;
 
         Ok(())
     }
 
-    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<u64>> {
-        if let Some(future) = &mut self.pending_fetch {
-            match Pin::new(future).poll(cx) {
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<u64>> {
+        let this = self.get_mut(); // Fix mutable borrowing
+
+        if let Some(future) = &mut this.pending_fetch {
+            let poll_result: Poll<IoResult<Bytes>> = Pin::new(future).poll(cx);
+            match poll_result {
                 Poll::Ready(Ok(bytes)) => {
-                    self.buffer = bytes;
-                    self.pending_fetch = None;
-                    return Poll::Ready(Ok(self.position));
+                    this.buffer = bytes;
+                    this.pending_fetch = None;
+                    return Poll::Ready(Ok(this.position));
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
         }
 
-        Poll::Ready(Ok(self.position))
+        Poll::Ready(Ok(this.position))
     }
 }
 
@@ -187,9 +189,8 @@ async fn test_seekable_http_stream() -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
     let client = Client::new();
-    let request = client.get("https://example.com/largefile.bin");
 
-    let mut stream = Seekable::new(request)?;
+    let mut stream = Seekable::new(move || client.get("https://example.com/largefile.bin"));
 
     let mut buf = vec![0u8; 16]; // Read 16 bytes
 
@@ -224,16 +225,30 @@ async fn test_seekable_http_stream() -> std::io::Result<()> {
 }
 
 #[tokio::test]
-async fn test_fetch_file_size() {
+async fn test_fetch_file_size_ovh() {
     use reqwest::Client;
 
     let client = Client::new();
-    let request = client.get("https://proof.ovh.net/files/100Mb.dat");
+    let stream = Seekable::new(move || client.get("https://proof.ovh.net/files/100Mb.dat"));
 
-    let size = Seekable::fetch_file_size(&request).await.unwrap();
+    let size = Seekable::fetch_file_size(&stream).await.unwrap();
 
     // Assert that file size is exactly 100MB (104857600 bytes)
     assert_eq!(size, 100 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn test_fetch_file_size_of1() {
+    use reqwest::Client;
+
+    let client = Client::new();
+
+    let stream =
+        Seekable::new(move || client.get("https://files.old-faithful.net/712/epoch-712.car"));
+
+    let size = Seekable::fetch_file_size(&stream).await.unwrap();
+
+    assert_eq!(size, 781436491980);
 }
 
 #[tokio::test]
@@ -241,7 +256,7 @@ async fn test_fetch_file_size_failure() {
     use reqwest::Client;
 
     let client = Client::new();
-    let request = client.get("https://proof.ovh.net/files/nonexistent.dat");
+    let stream = Seekable::new(move || client.get("https://proof.ovh.net/files/nonexistent.dat"));
 
-    Seekable::fetch_file_size(&request).await.unwrap_err();
+    Seekable::fetch_file_size(&stream).await.unwrap_err();
 }

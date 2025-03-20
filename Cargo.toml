@@ -7,3 +7,4 @@ description = "rseek is an adapter for reqwest that allows seeking in the respon
 keywords = ["reqwest", "seek", "async", "http"]
 
 [dependencies]
+reqwest = "0"

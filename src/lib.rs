@@ -102,7 +102,10 @@ where
                 instance.buffer_size = ideal_buffer_size(size);
                 Some(size)
             }
-            _ => None,
+            _ => {
+                instance.buffer_size = 64 * 1024; // 64 KB
+                None
+            }
         };
 
         instance

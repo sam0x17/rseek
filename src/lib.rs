@@ -21,17 +21,17 @@ const BUFFER_SIZE: u64 = 262144;
 /// Provides a seekable and asynchronous read interface for [`reqwest`] HTTP streams.
 /// This is useful for handling large files over HTTP where random access is required.
 ///
-/// # Type Parameters
+/// ## Type Parameters
 /// - `F`: A closure type that generates a [`RequestBuilder`] for HTTP requests.
 ///
-/// # Methods
+/// ## Methods
 /// - `new`: Creates a new [`Seekable`] instance and fetches the file size if available.
 ///
-/// # Traits Implemented
+/// ## Traits Implemented
 /// - `AsyncRead`: Allows asynchronous reading of data from the HTTP stream.
 /// - `AsyncSeek`: Allows seeking to specific positions in the HTTP stream.
 ///
-/// # Example
+/// ## Example
 /// ```
 /// use reqwest::Client;
 /// use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
@@ -52,14 +52,14 @@ const BUFFER_SIZE: u64 = 262144;
 /// }
 /// ```
 ///
-/// # Notes
+/// ## Notes
 /// - This implementation assumes the server supports HTTP range requests. Servers that do not
 ///   support range requests are still usable, however certain seeking features will be
 ///   unavailable.
 /// - If the file size cannot be determined, the implementation will attempt to fetch data
 ///   without bounds, relying on the server to handle the request appropriately.
 ///
-/// # Errors
+/// ## Errors
 /// - Returns `UnexpectedEof` if attempting to read past the end of the file.
 /// - Returns `InvalidInput` if seeking to a negative position.
 /// - Returns `Unsupported` if seeking from the end when the file size is unknown.
@@ -80,12 +80,12 @@ where
 {
     /// Creates a new [`Seekable`] instance and fetches the file size if available.
     ///
-    /// # Parameters
+    /// ## Parameters
     /// - `request_builder_factory`: A closure that generates a [`RequestBuilder`] for HTTP
-    ///  requests. This closure is called whenever a new HTTP request is required. The closure
-    ///  should return a [`RequestBuilder`] that is ready to be sent.
+    ///    requests. This closure is called whenever a new HTTP request is required. The closure
+    ///    should return a [`RequestBuilder`] that is ready to be sent.
     ///
-    /// # Returns
+    /// ## Returns
     /// A new [`Seekable`] instance.
     pub async fn new(request_builder_factory: F) -> Self {
         let mut instance = Self {

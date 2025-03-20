@@ -137,3 +137,45 @@ impl AsyncSeek for Seekable {
         Poll::Ready(Ok(self.position))
     }
 }
+
+#[tokio::test]
+async fn test_seekable_http_stream() -> std::io::Result<()> {
+    use reqwest::Client;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+
+    let client = Client::new();
+    let request = client.get("https://example.com/largefile.bin");
+
+    let mut stream = Seekable::new(request)?;
+
+    let mut buf = vec![0u8; 16]; // Read 16 bytes
+
+    // Read first 16 bytes at the start
+    stream.read_exact(&mut buf).await?;
+    println!("First 16 bytes: {:?}", buf);
+
+    // Seek forward by 1MB and read again
+    stream.seek(SeekFrom::Start(1_000_000)).await?;
+    stream.read_exact(&mut buf).await?;
+    println!("Bytes after seeking to 1MB: {:?}", buf);
+
+    // Seek forward again by another 512KB
+    stream.seek(SeekFrom::Current(512_000)).await?;
+    stream.read_exact(&mut buf).await?;
+    println!("Bytes after seeking to 1.5MB: {:?}", buf);
+
+    // Seek backward by 512KB (back to 1MB mark)
+    stream.seek(SeekFrom::Current(-512_000)).await?;
+    let mut buf_after_backseek = vec![0u8; 16];
+    stream.read_exact(&mut buf_after_backseek).await?;
+
+    // Verify that seeking back returns the same bytes as the first seek to 1MB
+    assert_eq!(
+        buf, buf_after_backseek,
+        "Bytes after seeking back should match original read"
+    );
+
+    println!("Seek test passed!");
+
+    Ok(())
+}

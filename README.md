@@ -1,3 +1,8 @@
+[![Crates.io](https://img.shields.io/crates/v/rseek)](https://crates.io/crates/rseek)
+[![docs.rs](https://img.shields.io/docsrs/rseek?label=docs)](https://docs.rs/rseek/latest/rseek/)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/sam0x17/rseek/ci.yaml)](https://github.com/sam0x17/rseek/actions/workflows/ci.yaml?query=branch%3Amain)
+[![MIT License](https://img.shields.io/github/license/sam0x17/rseek)](https://github.com/sam0x17/rseek/blob/main/LICENSE)
+
 Provides a seekable and asynchronous read interface for `reqwest` HTTP streams that allows
 you to seek forward or backward in an HTTP stream without having to download all the
 intermediate data. This is useful for handling large files over HTTP where random access is

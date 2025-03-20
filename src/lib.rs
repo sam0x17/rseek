@@ -67,7 +67,7 @@ where
             .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
 
         if !response.status().is_success() {
-            return Ok(0);
+            return Ok(u64::MAX);
             // return Err(IoError::new(
             //     ErrorKind::Other,
             //     format!("Unexpected response status: {}", response.status()),

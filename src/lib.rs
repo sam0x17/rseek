@@ -1,3 +1,11 @@
+//! Provides a seekable and asynchronous read interface for [`reqwest`] HTTP streams. This is
+//! useful for handling large files over HTTP where random access is required. This
+//! implementation assumes the server supports HTTP range requests. Servers that do not support
+//! range requests are still usable, however certain seeking features will be unavailable.
+//!
+//! If the file size cannot be determined, the implementation will attempt to fetch data
+//! without bounds, relying on the server to handle the request appropriately.
+
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::ops::Range;
 use std::pin::Pin;
@@ -23,7 +31,7 @@ const BUFFER_SIZE: u64 = 262144;
 /// - `AsyncRead`: Allows asynchronous reading of data from the HTTP stream.
 /// - `AsyncSeek`: Allows seeking to specific positions in the HTTP stream.
 ///
-/// # Examples
+/// # Example
 /// ```
 /// use reqwest::Client;
 /// use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};

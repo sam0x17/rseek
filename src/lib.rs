@@ -200,6 +200,11 @@ where
             "Failed to determine file size",
         ))
     }
+
+    /// Returns the total size of the file being downloaded, if known.
+    pub fn file_size(&self) -> Option<u64> {
+        self.file_size
+    }
 }
 
 impl<F> AsyncRead for Seekable<F>

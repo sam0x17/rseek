@@ -237,34 +237,53 @@ where
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<IoResult<()>> {
+        const LOW_WATER_DIVISOR: u64 = 4; // start next fetch when < buf_sz/4 bytes left
+
         let this = self.get_mut();
 
+        // EOF guard
         if let Some(file_size) = this.file_size {
             if this.position >= file_size {
                 return Poll::Ready(Err(IoError::new(ErrorKind::UnexpectedEof, "EOF reached")));
             }
         }
 
-        if this.buffer.is_empty() {
-            if this.pending_fetch.is_none() {
-                // use configurable pre-fetch length
+        /* -------------------------------------------------------------- *
+         * 1.  If no fetch is pending and the remaining buffered data      *
+         *     is below the low-water mark, kick off the next range GET.   *
+         * -------------------------------------------------------------- */
+        if this.pending_fetch.is_none() {
+            let low_water = (this.buffer_size / LOW_WATER_DIVISOR.max(1)).max(32 * 1024);
+            if this.buffer.len() < low_water as usize {
                 let fetch_size = this.buffer_size;
                 let end = this.position + fetch_size;
                 this.start_fetch(this.position..end);
             }
+        }
 
-            if let Some(fut) = &mut this.pending_fetch {
-                match Pin::new(fut).poll(cx) {
-                    Poll::Ready(Ok(bytes)) => {
-                        this.buffer = bytes;
-                        this.pending_fetch = None;
+        /* -------------------------------------------------------------- *
+         * 2.  If a fetch *is* pending, try to make progress on it.        *
+         * -------------------------------------------------------------- */
+        if let Some(fut) = &mut this.pending_fetch {
+            match Pin::new(fut).poll(cx) {
+                Poll::Ready(Ok(bytes)) => {
+                    this.buffer = bytes;
+                    this.pending_fetch = None;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    // we might still have some bytes left in `buffer`;
+                    // if not, we must wait for the fetch to finish.
+                    if this.buffer.is_empty() {
+                        return Poll::Pending;
                     }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
                 }
             }
         }
 
+        /* -------------------------------------------------------------- *
+         * 3.  Copy from internal buffer to caller’s buffer.               *
+         * -------------------------------------------------------------- */
         if let Some(file_size) = this.file_size {
             if this.buffer.is_empty() && file_size > 0 {
                 return Poll::Ready(Err(IoError::new(ErrorKind::UnexpectedEof, "EOF reached")));

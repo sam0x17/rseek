@@ -69,6 +69,8 @@ where
     file_size: Option<u64>,     // Store the file size
     position: u64,
     buffer: Bytes,
+    /// How many bytes we pre-fetch per range GET (also used as the
+    /// capacity of the BufReader that wraps the response body).
     buffer_size: u64,
     pending_fetch: Option<BoxFuture<'static, IoResult<Bytes>>>,
 }
@@ -92,21 +94,21 @@ where
             file_size: None,
             position: 0,
             buffer: Bytes::new(),
-            buffer_size: 0,
+            buffer_size: 0, // will be set a few lines below
             pending_fetch: None,
         };
 
-        // Fetch and store file size
-        instance.file_size = match instance.fetch_file_size().await {
-            Ok(size) => {
-                instance.buffer_size = ideal_buffer_size(size);
-                Some(size)
+        // Try to learn the file size
+        match instance.fetch_file_size().await {
+            Ok(sz) => {
+                instance.file_size = Some(sz);
+                instance.buffer_size = ideal_buffer_size(sz);
             }
-            _ => {
-                instance.buffer_size = 64 * 1024; // 64 KB
-                None
+            Err(_) => {
+                instance.file_size = None;
+                instance.buffer_size = 256 * 1024; // fallback: 256 KiB
             }
-        };
+        }
 
         instance
     }
@@ -118,11 +120,29 @@ where
             file_size: None,
             position: 0,
             buffer: Bytes::new(),
-            buffer_size,
+            buffer_size, // honor caller’s choice (even 0)
             pending_fetch: None,
         };
-        instance.file_size = instance.fetch_file_size().await.ok();
+
+        match instance.fetch_file_size().await {
+            Ok(sz) => instance.file_size = Some(sz),
+            Err(_) => instance.file_size = None,
+        }
+
+        if instance.buffer_size == 0 {
+            // caller said "pick for me"
+            instance.buffer_size = ideal_buffer_size(instance.file_size.unwrap_or(0));
+        }
+
         instance
+    }
+
+    /// Change the pre-fetch size after construction.
+    pub fn with_buffer_size(mut self, bytes: u64) -> Self {
+        if bytes != 0 {
+            self.buffer_size = bytes;
+        }
+        self
     }
 
     fn start_fetch(&mut self, range: Range<u64>) {
@@ -131,35 +151,32 @@ where
                 self.pending_fetch = Some(Box::pin(async { Ok(Bytes::new()) }));
                 return;
             }
-
             let end = range.end.min(file_size);
             if end <= range.start {
                 return;
             }
-
             (self.request_builder_factory)()
                 .header("Range", format!("bytes={}-{}", range.start, end - 1))
         } else {
-            // No file size known, use open-ended range request
+            // Unknown size → open-ended range
             (self.request_builder_factory)().header("Range", format!("bytes={}-", range.start))
         };
 
+        // --- buffered fetch ----------------------------------------------------
         let fetch_future = async move {
             let response = request
                 .send()
                 .await
                 .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
 
+            // Download the requested slice in one go; the slice size equals
+            // `range.end - range.start` (our pre-fetch length).
             let body = response
                 .bytes()
                 .await
                 .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
 
-            if body.is_empty() {
-                return Ok(Bytes::new());
-            }
-
-            Ok(body)
+            Ok(body) // `body` is a `Bytes`
         };
 
         self.pending_fetch = Some(Box::pin(fetch_future));
@@ -218,7 +235,6 @@ where
     ) -> Poll<IoResult<()>> {
         let this = self.get_mut();
 
-        // If we're past EOF, return EOF error
         if let Some(file_size) = this.file_size {
             if this.position >= file_size {
                 return Poll::Ready(Err(IoError::new(ErrorKind::UnexpectedEof, "EOF reached")));
@@ -227,14 +243,14 @@ where
 
         if this.buffer.is_empty() {
             if this.pending_fetch.is_none() {
+                // use configurable pre-fetch length
                 let fetch_size = this.buffer_size;
                 let end = this.position + fetch_size;
-
                 this.start_fetch(this.position..end);
             }
 
-            if let Some(future) = &mut this.pending_fetch {
-                match Pin::new(future).poll(cx) {
+            if let Some(fut) = &mut this.pending_fetch {
+                match Pin::new(fut).poll(cx) {
                     Poll::Ready(Ok(bytes)) => {
                         this.buffer = bytes;
                         this.pending_fetch = None;
@@ -328,21 +344,25 @@ where
 pub const fn ideal_buffer_size(file_size: u64) -> u64 {
     // 1 MB
     if file_size < 1024 * 1024 {
-        // 8 KB
-        return 8192;
+        // 128 KB
+        return 128 * 1024;
     }
-    // 10 MB
-    if file_size < 1024 * 1024 * 10 {
-        // 64 KB
-        return 65536;
+    // 64 MB
+    if file_size < 1024 * 1024 * 64 {
+        // 8 MB
+        return 1024 * 1024 * 8;
     }
     // 1 GB
     if file_size < 1024 * 1024 * 1024 {
-        // 256 KB
-        return 262144;
+        // 16 MB
+        return 16 * 1024 * 1024;
     }
-    // 512 KB
-    524288
+    // 10 GB
+    if file_size < 1024 * 1024 * 1024 * 10 {
+        // 32 MB
+        return 32 * 1024 * 1024;
+    }
+    return 64 * 1024 * 1024; // 64 MB
 }
 
 #[tokio::test]

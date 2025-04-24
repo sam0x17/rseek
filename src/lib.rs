@@ -82,9 +82,9 @@ where
     /// Creates a new [`Seekable`] instance and fetches the file size if available.
     ///
     /// ## Parameters
-    /// - `request_builder_factory`: A closure that generates a [`RequestBuilder`] for HTTP
-    ///    requests. This closure is called whenever a new HTTP request is required. The closure
-    ///    should return a [`RequestBuilder`] that is ready to be sent.
+    /// request_builder_factory`: A closure that generates a [`RequestBuilder`] for HTTP
+    /// requests. This closure is called whenever a new HTTP request is required. The
+    /// closure should return a [`RequestBuilder`] that is ready to be sent.
     ///
     /// ## Returns
     /// A new [`Seekable`] instance.
@@ -362,7 +362,7 @@ pub const fn ideal_buffer_size(file_size: u64) -> u64 {
         // 32 MB
         return 32 * 1024 * 1024;
     }
-    return 64 * 1024 * 1024; // 64 MB
+    64 * 1024 * 1024 // 64 MB
 }
 
 #[tokio::test]

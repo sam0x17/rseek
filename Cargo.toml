@@ -12,5 +12,5 @@ documentation = "https://docs.rs/rseek/latest/rseek/"
 [dependencies]
 bytes = "1"
 futures = "0"
-reqwest = "0"
+reqwest = { version = "0", features = ["stream"] }
 tokio = { version = "1", features = ["full"] }

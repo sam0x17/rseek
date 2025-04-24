@@ -146,6 +146,7 @@ where
     }
 
     fn start_fetch(&mut self, range: Range<u64>) {
+        // ── build Range request ────────────────────────────────────────────────
         let request = if let Some(file_size) = self.file_size {
             if range.start >= file_size {
                 self.pending_fetch = Some(Box::pin(async { Ok(Bytes::new()) }));
@@ -162,21 +163,24 @@ where
             (self.request_builder_factory)().header("Range", format!("bytes={}-", range.start))
         };
 
-        // --- buffered fetch ----------------------------------------------------
+        // ── async fetch future that streams data into a Vec<u8> ────────────────
         let fetch_future = async move {
+            use futures::StreamExt;
+
             let response = request
                 .send()
                 .await
                 .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
 
-            // Download the requested slice in one go; the slice size equals
-            // `range.end - range.start` (our pre-fetch length).
-            let body = response
-                .bytes()
-                .await
-                .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
+            let mut stream = response.bytes_stream();
+            let mut v = Vec::<u8>::new();
 
-            Ok(body) // `body` is a `Bytes`
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
+                v.extend_from_slice(&chunk);
+            }
+
+            Ok(Bytes::from(v))
         };
 
         self.pending_fetch = Some(Box::pin(fetch_future));
@@ -342,27 +346,21 @@ where
 
 /// Default buffer size for reading data from the HTTP stream.
 pub const fn ideal_buffer_size(file_size: u64) -> u64 {
-    // 1 MB
-    if file_size < 1024 * 1024 {
-        // 128 KB
-        return 128 * 1024;
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if file_size < 2 * MB {
+        256 * KB
+    } else if file_size < 128 * MB {
+        4 * MB
+    } else if file_size < 1 * GB {
+        16 * MB
+    } else if file_size < 10 * GB {
+        32 * MB
+    } else {
+        64 * MB
     }
-    // 64 MB
-    if file_size < 1024 * 1024 * 64 {
-        // 8 MB
-        return 1024 * 1024 * 8;
-    }
-    // 1 GB
-    if file_size < 1024 * 1024 * 1024 {
-        // 16 MB
-        return 16 * 1024 * 1024;
-    }
-    // 10 GB
-    if file_size < 1024 * 1024 * 1024 * 10 {
-        // 32 MB
-        return 32 * 1024 * 1024;
-    }
-    64 * 1024 * 1024 // 64 MB
 }
 
 #[tokio::test]

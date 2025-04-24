@@ -537,3 +537,17 @@ async fn test_seek_to_end_of_enormous_file() {
         ]
     );
 }
+
+#[tokio::test]
+async fn test_long_read() {
+    use reqwest::Client;
+    use tokio::io::AsyncReadExt;
+
+    let client = Client::new();
+
+    let mut stream =
+        Seekable::new(move || client.get("https://files.old-faithful.net/725/epoch-725.car")).await;
+
+    let mut buf = vec![0u8; 400 * 1024 * 1024];
+    stream.read_exact(&mut buf).await.unwrap();
+}

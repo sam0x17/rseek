@@ -14,3 +14,4 @@ bytes = "1"
 futures = "0"
 reqwest = { version = "0", features = ["stream"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0"

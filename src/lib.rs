@@ -1,384 +1,190 @@
-//! Provides a seekable and asynchronous read interface for [`reqwest`] HTTP streams. This is
-//! useful for handling large files over HTTP where random access is required. This
-//! implementation assumes the server supports HTTP range requests. Servers that do not support
-//! range requests are still usable, however certain seeking features will be unavailable.
-//!
-//! If the file size cannot be determined, the implementation will attempt to fetch data
-//! without bounds, relying on the server to handle the request appropriately.
+//! Provides a seekable and asynchronous read interface for [`reqwest`] HTTP streams.
+//! Continually streams data from a single HTTP request, tearing down and restarting only on seek.
 
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
-use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use bytes::{Buf, Bytes};
-use futures::future::BoxFuture;
-use reqwest::RequestBuilder;
-use tokio::io::{AsyncRead, AsyncSeek, SeekFrom};
+use bytes::Bytes;
+use futures::TryStreamExt;
+use reqwest::{RequestBuilder, Response};
+use tokio::io::{AsyncRead, AsyncSeek, ReadBuf, SeekFrom};
+use tokio_util::io::StreamReader;
 
-/// Provides a seekable and asynchronous read interface for [`reqwest`] HTTP streams.
-/// This is useful for handling large files over HTTP where random access is required.
-///
-/// ## Type Parameters
-/// - `F`: A closure type that generates a [`RequestBuilder`] for HTTP requests.
-///
-/// ## Methods
-/// - `new`: Creates a new [`Seekable`] instance and fetches the file size if available.
-///
-/// ## Traits Implemented
-/// - `AsyncRead`: Allows asynchronous reading of data from the HTTP stream.
-/// - `AsyncSeek`: Allows seeking to specific positions in the HTTP stream.
-///
-/// ## Example
-/// ```
-/// use reqwest::Client;
-/// use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-///
-/// #[tokio::main]
-/// async fn main() {
-///     use rseek::Seekable;
-///     let client = Client::new();
-///     let mut stream = Seekable::new(move || client.get("https://example.com/largefile.bin")).await;
-///
-///     let mut buf = vec![0u8; 16];
-///     stream.read_exact(&mut buf).await.unwrap();
-///     println!("First 16 bytes: {:?}", buf);
-///
-///     stream.seek(SeekFrom::Start(1_000_000)).await.unwrap();
-///     stream.read_exact(&mut buf).await.unwrap();
-///     println!("Bytes after seeking to 1MB: {:?}", buf);
-/// }
-/// ```
-///
-/// ## Notes
-/// - This implementation assumes the server supports HTTP range requests. Servers that do not
-///   support range requests are still usable, however certain seeking features will be
-///   unavailable.
-/// - If the file size cannot be determined, the implementation will attempt to fetch data
-///   without bounds, relying on the server to handle the request appropriately.
-///
-/// ## Errors
-/// - Returns `UnexpectedEof` if attempting to read past the end of the file.
-/// - Returns `InvalidInput` if seeking to a negative position.
-/// - Returns `Unsupported` if seeking from the end when the file size is unknown.
+/// A continuously streaming, seekable HTTP reader.
+/// Only on `seek` does it drop the connection and open a new ranged request.
 pub struct Seekable<F>
 where
     F: Fn() -> RequestBuilder + Send + Sync + 'static,
 {
-    request_builder_factory: F, // Closure to generate RequestBuilder
-    file_size: Option<u64>,     // Store the file size
-    position: u64,
-    buffer: Bytes,
-    /// How many bytes we pre-fetch per range GET (also used as the
-    /// capacity of the BufReader that wraps the response body).
-    buffer_size: u64,
-    pending_fetch: Option<BoxFuture<'static, IoResult<Bytes>>>,
+    factory: F,
+    /// Known file size, if determined
+    pub file_size: Option<u64>,
+    /// Current read position
+    pub position: u64,
+
+    // In-flight response future when opening connection
+    init_fetch: Option<Pin<Box<dyn futures::Future<Output = IoResult<Response>> + Send>>>,
+    // Once the response is ready, this yields chunks
+    reader: Option<
+        StreamReader<Pin<Box<dyn futures::Stream<Item = Result<Bytes, IoError>> + Send>>, Bytes>,
+    >,
 }
+
+// Allow using AsyncReadExt and AsyncSeekExt
+impl<F> Unpin for Seekable<F> where F: Fn() -> RequestBuilder + Send + Sync + 'static {}
 
 impl<F> Seekable<F>
 where
     F: Fn() -> RequestBuilder + Send + Sync + 'static,
 {
-    /// Creates a new [`Seekable`] instance and fetches the file size if available.
-    ///
-    /// ## Parameters
-    /// request_builder_factory`: A closure that generates a [`RequestBuilder`] for HTTP
-    /// requests. This closure is called whenever a new HTTP request is required. The
-    /// closure should return a [`RequestBuilder`] that is ready to be sent.
-    ///
-    /// ## Returns
-    /// A new [`Seekable`] instance.
-    pub async fn new(request_builder_factory: F) -> Self {
-        let mut instance = Self {
-            request_builder_factory,
+    /// Create a new `Seekable`, learn length (if possible), then start an initial full GET.
+    pub async fn new(factory: F) -> Self {
+        let mut s = Seekable {
+            factory,
             file_size: None,
             position: 0,
-            buffer: Bytes::new(),
-            buffer_size: 0, // will be set a few lines below
-            pending_fetch: None,
+            init_fetch: None,
+            reader: None,
         };
-
-        // Try to learn the file size
-        match instance.fetch_file_size().await {
-            Ok(sz) => {
-                instance.file_size = Some(sz);
-                instance.buffer_size = ideal_buffer_size(sz);
-            }
-            Err(_) => {
-                instance.file_size = None;
-                instance.buffer_size = 256 * 1024; // fallback: 256 KiB
-            }
+        // try to determine length, ignore failures
+        if let Ok(sz) = s.fetch_file_size().await {
+            s.file_size = Some(sz);
         }
-
-        instance
+        // open initial full GET
+        s.schedule_fetch(0);
+        s
     }
 
-    /// Allows overriding the intelligently-calculated buffer size with a custom value. See [`Self::new`].
-    pub async fn new_with_buffer_size(request_builder_factory: F, buffer_size: u64) -> Self {
-        let mut instance = Self {
-            request_builder_factory,
-            file_size: None,
-            position: 0,
-            buffer: Bytes::new(),
-            buffer_size, // honor caller’s choice (even 0)
-            pending_fetch: None,
-        };
-
-        match instance.fetch_file_size().await {
-            Ok(sz) => instance.file_size = Some(sz),
-            Err(_) => instance.file_size = None,
-        }
-
-        if instance.buffer_size == 0 {
-            // caller said "pick for me"
-            instance.buffer_size = ideal_buffer_size(instance.file_size.unwrap_or(0));
-        }
-
-        instance
+    /// Create a new `Seekable` with an advisory buffer size (ignored).
+    pub async fn new_with_buffer_size(factory: F, _buffer_size: u64) -> Self {
+        Self::new(factory).await
     }
 
-    /// Change the pre-fetch size after construction.
-    pub fn with_buffer_size(mut self, bytes: u64) -> Self {
-        if bytes != 0 {
-            self.buffer_size = bytes;
-        }
+    /// No-op; kept for API compatibility.
+    pub fn with_buffer_size(self, _bytes: u64) -> Self {
         self
     }
 
-    fn start_fetch(&mut self, range: Range<u64>) {
-        // ── build Range request ────────────────────────────────────────────────
-        let request = if let Some(file_size) = self.file_size {
-            if range.start >= file_size {
-                self.pending_fetch = Some(Box::pin(async { Ok(Bytes::new()) }));
-                return;
-            }
-            let end = range.end.min(file_size);
-            if end <= range.start {
-                return;
-            }
-            (self.request_builder_factory)()
-                .header("Range", format!("bytes={}-{}", range.start, end - 1))
-        } else {
-            // Unknown size → open-ended range
-            (self.request_builder_factory)().header("Range", format!("bytes={}-", range.start))
-        };
-
-        // ── async fetch future that streams data into a Vec<u8> ────────────────
-        let fetch_future = async move {
-            use futures::StreamExt;
-
-            let response = request
-                .send()
-                .await
-                .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
-
-            let mut stream = response.bytes_stream();
-            let mut v = Vec::<u8>::new();
-
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
-                v.extend_from_slice(&chunk);
-            }
-
-            Ok(Bytes::from(v))
-        };
-
-        self.pending_fetch = Some(Box::pin(fetch_future));
-    }
-
-    async fn fetch_file_size(&self) -> IoResult<u64> {
-        let request = (self.request_builder_factory)().header("Range", "bytes=0-0");
-
-        let response = request
+    /// Probe file size via a small range GET.
+    pub async fn fetch_file_size(&self) -> IoResult<u64> {
+        let req = (self.factory)().header("Range", "bytes=0-0");
+        let resp = req
             .send()
             .await
             .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
-
-        if !response.status().is_success() {
-            return Err(IoError::new(
-                ErrorKind::Other,
-                format!("Unexpected response status: {}", response.status()),
-            ));
-        }
-
-        if let Some(content_range) = response.headers().get("content-range") {
-            let content_range = content_range.to_str().unwrap_or("");
-            if let Some(size_str) = content_range.split('/').nth(1) {
-                if let Ok(size) = size_str.parse::<u64>() {
-                    return Ok(size);
+        if let Some(cr) = resp.headers().get("content-range") {
+            let s = cr.to_str().unwrap_or("");
+            if let Some(total) = s.split('/').nth(1) {
+                if let Ok(n) = total.parse::<u64>() {
+                    return Ok(n);
                 }
             }
         }
-
-        if let Some(content_length) = response.headers().get("content-length") {
-            if let Ok(size) = content_length.to_str().unwrap_or("").parse::<u64>() {
-                return Ok(size);
+        if let Some(len) = resp.headers().get("content-length") {
+            if let Ok(n) = len.to_str().unwrap_or("").parse::<u64>() {
+                return Ok(n);
             }
         }
-
         Err(IoError::new(
             ErrorKind::Other,
-            "Failed to determine file size",
+            "failed to determine file size",
         ))
     }
 
-    /// Returns the total size of the file being downloaded, if known.
-    pub fn file_size(&self) -> Option<u64> {
-        self.file_size
+    /// Internal: begin a ranged GET at `pos` and clear existing reader.
+    fn schedule_fetch(&mut self, pos: u64) {
+        self.reader = None;
+        let mut builder = (self.factory)();
+        if let Some(sz) = self.file_size {
+            let end = sz.saturating_sub(1);
+            builder = builder.header("Range", format!("bytes={}-{}", pos, end));
+        } else {
+            builder = builder.header("Range", format!("bytes={}-", pos));
+        }
+        let fut = async move {
+            builder
+                .send()
+                .await
+                .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))
+        };
+        self.init_fetch = Some(Box::pin(fut));
     }
 }
 
 impl<F> AsyncRead for Seekable<F>
 where
-    F: Fn() -> RequestBuilder + Send + Sync + 'static + Unpin,
+    F: Fn() -> RequestBuilder + Send + Sync + 'static,
 {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
+        buf: &mut ReadBuf<'_>,
     ) -> Poll<IoResult<()>> {
-        const LOW_WATER_DIVISOR: u64 = 4; // start next fetch when < buf_sz/4 bytes left
+        // SAFETY: we never move `factory` or pin-sensitive fields.
+        let this = unsafe { Pin::get_unchecked_mut(self) };
 
-        let this = self.get_mut();
-
-        // EOF guard
-        if let Some(file_size) = this.file_size {
-            if this.position >= file_size {
-                return Poll::Ready(Err(IoError::new(ErrorKind::UnexpectedEof, "EOF reached")));
-            }
+        // If reader exists, delegate
+        if let Some(reader) = &mut this.reader {
+            return Pin::new(reader).poll_read(cx, buf);
         }
-
-        /* -------------------------------------------------------------- *
-         * 1.  If no fetch is pending and the remaining buffered data      *
-         *     is below the low-water mark, kick off the next range GET.   *
-         * -------------------------------------------------------------- */
-        if this.pending_fetch.is_none() {
-            let low_water = (this.buffer_size / LOW_WATER_DIVISOR.max(1)).max(32 * 1024);
-            if this.buffer.len() < low_water as usize {
-                let fetch_size = this.buffer_size;
-                let end = this.position + fetch_size;
-                this.start_fetch(this.position..end);
-            }
-        }
-
-        /* -------------------------------------------------------------- *
-         * 2.  If a fetch *is* pending, try to make progress on it.        *
-         * -------------------------------------------------------------- */
-        if let Some(fut) = &mut this.pending_fetch {
-            match Pin::new(fut).poll(cx) {
-                Poll::Ready(Ok(bytes)) => {
-                    this.buffer = bytes;
-                    this.pending_fetch = None;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    // we might still have some bytes left in `buffer`;
-                    // if not, we must wait for the fetch to finish.
-                    if this.buffer.is_empty() {
-                        return Poll::Pending;
-                    }
-                }
-            }
-        }
-
-        /* -------------------------------------------------------------- *
-         * 3.  Copy from internal buffer to caller’s buffer.               *
-         * -------------------------------------------------------------- */
-        if let Some(file_size) = this.file_size {
-            if this.buffer.is_empty() && file_size > 0 {
-                return Poll::Ready(Err(IoError::new(ErrorKind::UnexpectedEof, "EOF reached")));
-            }
-        }
-
-        let to_copy = buf.remaining().min(this.buffer.len());
-        buf.put_slice(&this.buffer[..to_copy]);
-        this.buffer.advance(to_copy);
-        this.position += to_copy as u64;
-
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl<F> AsyncSeek for Seekable<F>
-where
-    F: Fn() -> RequestBuilder + Send + Sync + 'static + Unpin,
-{
-    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> IoResult<()> {
-        let this = self.get_mut();
-
-        this.position = match position {
-            SeekFrom::Start(pos) => pos,
-            SeekFrom::End(offset) => {
-                let file_size = this.file_size.ok_or_else(|| {
-                    IoError::new(ErrorKind::Unsupported, "File size not available")
-                })?;
-
-                let new_pos = file_size as i64 + offset;
-                if new_pos < 0 {
-                    return Err(IoError::new(
-                        ErrorKind::InvalidInput,
-                        "Negative seek position",
-                    ));
-                }
-                new_pos as u64
-            }
-            SeekFrom::Current(offset) => {
-                let new_pos = this.position as i64 + offset;
-                if new_pos < 0 {
-                    return Err(IoError::new(
-                        ErrorKind::InvalidInput,
-                        "Negative seek position",
-                    ));
-                }
-                new_pos as u64
-            }
-        };
-
-        if let Some(file_size) = this.file_size {
-            this.position = this.position.min(file_size);
-        }
-
-        this.buffer = Bytes::new();
-        this.pending_fetch = None;
-
-        Ok(())
-    }
-
-    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<u64>> {
-        let this = self.get_mut();
-
-        if let Some(future) = &mut this.pending_fetch {
-            match Pin::new(future).poll(cx) {
-                Poll::Ready(Ok(bytes)) => {
-                    this.buffer = bytes;
-                    this.pending_fetch = None;
-                    return Poll::Ready(Ok(this.position));
+        // Otherwise finalize initial fetch
+        if let Some(fut) = &mut this.init_fetch {
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(resp)) => {
+                    let stream = resp
+                        .bytes_stream()
+                        .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()));
+                    let boxed = Box::pin(stream);
+                    this.reader = Some(StreamReader::new(boxed));
+                    this.init_fetch = None;
+                    return AsyncRead::poll_read(Pin::new(&mut *this), cx, buf);
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
         }
-
-        Poll::Ready(Ok(this.position))
+        // no connection → EOF
+        Poll::Ready(Err(IoError::new(ErrorKind::UnexpectedEof, "stream closed")))
     }
 }
 
-/// Default buffer size for reading data from the HTTP stream.
-pub const fn ideal_buffer_size(file_size: u64) -> u64 {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
+impl<F> AsyncSeek for Seekable<F>
+where
+    F: Fn() -> RequestBuilder + Send + Sync + 'static,
+{
+    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> IoResult<()> {
+        let this = unsafe { Pin::get_unchecked_mut(self) };
+        // compute absolute new position
+        let new_pos = match position {
+            SeekFrom::Start(n) => n,
+            SeekFrom::Current(off) => {
+                let tmp = this.position as i64 + off;
+                if tmp < 0 {
+                    return Err(IoError::new(ErrorKind::InvalidInput, "negative seek"));
+                }
+                tmp as u64
+            }
+            SeekFrom::End(off) => {
+                let sz = this
+                    .file_size
+                    .ok_or_else(|| IoError::new(ErrorKind::Unsupported, "length unknown"))?;
+                let tmp = sz as i64 + off;
+                if tmp < 0 {
+                    return Err(IoError::new(ErrorKind::InvalidInput, "negative seek"));
+                }
+                tmp as u64
+            }
+        };
+        this.position = new_pos.min(this.file_size.unwrap_or(u64::MAX));
+        this.init_fetch = None;
+        this.schedule_fetch(this.position);
+        Ok(())
+    }
 
-    if file_size < 2 * MB {
-        256 * KB
-    } else if file_size < 128 * MB {
-        4 * MB
-    } else if file_size < 1 * GB {
-        16 * MB
-    } else if file_size < 10 * GB {
-        32 * MB
-    } else {
-        64 * MB
+    fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<IoResult<u64>> {
+        let this = unsafe { Pin::get_unchecked_mut(self) };
+        Poll::Ready(Ok(this.position))
     }
 }
 

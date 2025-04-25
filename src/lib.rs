@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures::TryStreamExt;
-use reqwest::{RequestBuilder, Response, StatusCode};
+use reqwest::{RequestBuilder, Response};
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf, SeekFrom};
 use tokio_util::io::StreamReader;
 
@@ -121,7 +121,7 @@ where
     F: Fn() -> RequestBuilder + Send + Sync + 'static,
 {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<IoResult<()>> {

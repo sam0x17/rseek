@@ -56,16 +56,6 @@ where
         s
     }
 
-    /// Create a new `Seekable` with an advisory buffer size (ignored).
-    pub async fn new_with_buffer_size(factory: F, _buffer_size: u64) -> Self {
-        Self::new(factory).await
-    }
-
-    /// No-op; kept for API compatibility.
-    pub fn with_buffer_size(self, _bytes: u64) -> Self {
-        self
-    }
-
     /// Probe file size via a small range GET.
     pub async fn fetch_file_size(&self) -> IoResult<u64> {
         // Perform a small range request and only accept 206 Partial Content

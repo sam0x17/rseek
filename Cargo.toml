@@ -11,7 +11,7 @@ documentation = "https://docs.rs/rseek/latest/rseek/"
 
 [dependencies]
 bytes = "1"
-futures = "0"
-reqwest = { version = "0", features = ["stream"] }
-tokio = { version = "1", features = ["full"] }
-tokio-util = "0"
+futures = ">= 0.3"
+reqwest = { version = ">= 0.12", features = ["stream"] }
+tokio = { version = ">= 1.44", features = ["full"] }
+tokio-util = ">= 0.7"

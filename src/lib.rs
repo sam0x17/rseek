@@ -124,10 +124,24 @@ where
         // SAFETY: we never move `factory` or pin-sensitive fields.
         let this = unsafe { Pin::get_unchecked_mut(self) };
 
-        // If reader exists, delegate
-        if let Some(reader) = &mut this.reader {
-            return Pin::new(reader).poll_read(cx, buf);
+        // EOF guard: if known size and at or past EOF, return UnexpectedEof
+        if let Some(sz) = this.file_size {
+            if this.position >= sz {
+                return Poll::Ready(Err(IoError::new(ErrorKind::UnexpectedEof, "EOF reached")));
+            }
         }
+
+        // If reader exists, delegate and update position
+        if let Some(reader) = &mut this.reader {
+            let before = buf.filled().len();
+            let res = Pin::new(reader).poll_read(cx, buf);
+            if let Poll::Ready(Ok(())) = &res {
+                let read = buf.filled().len() - before;
+                this.position += read as u64;
+            }
+            return res;
+        }
+
         // Otherwise finalize initial fetch
         if let Some(fut) = &mut this.init_fetch {
             match fut.as_mut().poll(cx) {
@@ -138,7 +152,8 @@ where
                     let boxed = Box::pin(stream);
                     this.reader = Some(StreamReader::new(boxed));
                     this.init_fetch = None;
-                    return AsyncRead::poll_read(Pin::new(&mut *this), cx, buf);
+                    // now that we have a reader, recurse into read
+                    return AsyncRead::poll_read(Pin::new(this), cx, buf);
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -194,35 +209,27 @@ async fn test_seekable_http_stream() {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
     let client = Client::new();
-
     let mut stream = Seekable::new(move || client.get("https://example.com/largefile.bin")).await;
+    let mut buf = vec![0u8; 16];
 
-    let mut buf = vec![0u8; 16]; // Read 16 bytes
-
-    // Read first 16 bytes at the start
+    // Read start
     stream.read_exact(&mut buf).await.unwrap();
-    println!("First 16 bytes: {:?}", buf);
 
-    // Seek forward by 1MB and read again
+    // Seek + read at 1MB
     stream.seek(SeekFrom::Start(1_000_000)).await.unwrap();
     stream.read_exact(&mut buf).await.unwrap();
-    println!("Bytes after seeking to 1MB: {:?}", buf);
+    let first_1mb = buf.clone();
 
-    // Seek forward again by another 512KB
+    // Seek + read at 1.5MB
     stream.seek(SeekFrom::Current(512_000)).await.unwrap();
     stream.read_exact(&mut buf).await.unwrap();
-    println!("Bytes after seeking to 1.5MB: {:?}", buf);
 
-    // Seek backward by 512KB (back to 1MB mark)
-    stream.seek(SeekFrom::Current(-512_000)).await.unwrap();
-    let mut buf_after_backseek = vec![0u8; 16];
-    stream.read_exact(&mut buf_after_backseek).await.unwrap();
-
-    // Verify that seeking back returns the same bytes as the first seek to 1MB
-    assert_eq!(
-        buf, buf_after_backseek,
-        "Bytes after seeking back should match original read"
-    );
+    // Backward seek relative to last read to 1MB
+    let back_offset = -(512_000 + buf.len() as i64);
+    stream.seek(SeekFrom::Current(back_offset)).await.unwrap();
+    let mut back_buf = vec![0u8; 16];
+    stream.read_exact(&mut back_buf).await.unwrap();
+    assert_eq!(back_buf, first_1mb);
 }
 
 #[tokio::test]

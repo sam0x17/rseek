@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures::TryStreamExt;
-use reqwest::{RequestBuilder, Response};
+use reqwest::{RequestBuilder, Response, StatusCode};
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf, SeekFrom};
 use tokio_util::io::StreamReader;
 
@@ -68,22 +68,27 @@ where
 
     /// Probe file size via a small range GET.
     pub async fn fetch_file_size(&self) -> IoResult<u64> {
+        // Perform a small range request and only accept 206 Partial Content
         let req = (self.factory)().header("Range", "bytes=0-0");
         let resp = req
             .send()
             .await
             .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
-        if let Some(cr) = resp.headers().get("content-range") {
-            let s = cr.to_str().unwrap_or("");
-            if let Some(total) = s.split('/').nth(1) {
-                if let Ok(n) = total.parse::<u64>() {
-                    return Ok(n);
-                }
-            }
+        if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            // Range not supported
+            return Err(IoError::new(
+                ErrorKind::Unsupported,
+                "server does not support range requests",
+            ));
         }
-        if let Some(len) = resp.headers().get("content-length") {
-            if let Ok(n) = len.to_str().unwrap_or("").parse::<u64>() {
-                return Ok(n);
+        // Parse Content-Range header: bytes 0-0/size
+        if let Some(cr) = resp.headers().get("content-range") {
+            if let Ok(s) = cr.to_str() {
+                if let Some(total) = s.split('/').nth(1) {
+                    if let Ok(n) = total.parse::<u64>() {
+                        return Ok(n);
+                    }
+                }
             }
         }
         Err(IoError::new(
@@ -92,7 +97,6 @@ where
         ))
     }
 
-    /// Internal: begin a ranged GET at `pos` and clear existing reader.
     fn schedule_fetch(&mut self, pos: u64) {
         self.reader = None;
         let mut builder = (self.factory)();
@@ -117,49 +121,48 @@ where
     F: Fn() -> RequestBuilder + Send + Sync + 'static,
 {
     fn poll_read(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<IoResult<()>> {
-        // SAFETY: we never move `factory` or pin-sensitive fields.
+        // SAFETY: Seekable is Unpin
         let this = unsafe { Pin::get_unchecked_mut(self) };
 
-        // EOF guard: if known size and at or past EOF, return UnexpectedEof
+        // EOF guard
         if let Some(sz) = this.file_size {
             if this.position >= sz {
                 return Poll::Ready(Err(IoError::new(ErrorKind::UnexpectedEof, "EOF reached")));
             }
         }
 
-        // If reader exists, delegate and update position
+        // Delegate to existing reader
         if let Some(reader) = &mut this.reader {
             let before = buf.filled().len();
             let res = Pin::new(reader).poll_read(cx, buf);
             if let Poll::Ready(Ok(())) = &res {
-                let read = buf.filled().len() - before;
-                this.position += read as u64;
+                this.position += (buf.filled().len() - before) as u64;
             }
             return res;
         }
 
-        // Otherwise finalize initial fetch
+        // Complete initial fetch
         if let Some(fut) = &mut this.init_fetch {
             match fut.as_mut().poll(cx) {
                 Poll::Ready(Ok(resp)) => {
                     let stream = resp
                         .bytes_stream()
                         .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()));
-                    let boxed = Box::pin(stream);
-                    this.reader = Some(StreamReader::new(boxed));
+                    this.reader = Some(StreamReader::new(Box::pin(stream)));
                     this.init_fetch = None;
-                    // now that we have a reader, recurse into read
-                    return AsyncRead::poll_read(Pin::new(this), cx, buf);
+                    // Recurse into reader
+                    let pinned = unsafe { Pin::new_unchecked(this) };
+                    return AsyncRead::poll_read(pinned, cx, buf);
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
         }
-        // no connection → EOF
+
         Poll::Ready(Err(IoError::new(ErrorKind::UnexpectedEof, "stream closed")))
     }
 }
@@ -169,7 +172,7 @@ where
     F: Fn() -> RequestBuilder + Send + Sync + 'static,
 {
     fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> IoResult<()> {
-        let this = unsafe { Pin::get_unchecked_mut(self) };
+        let this = self.get_mut();
         // compute absolute new position
         let new_pos = match position {
             SeekFrom::Start(n) => n,
@@ -198,7 +201,7 @@ where
     }
 
     fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<IoResult<u64>> {
-        let this = unsafe { Pin::get_unchecked_mut(self) };
+        let this = self.get_mut();
         Poll::Ready(Ok(this.position))
     }
 }

@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncSeek, ReadBuf, SeekFrom};
 use tokio_util::io::StreamReader;
 
 type SReader =
-    StreamReader<Pin<Box<dyn futures::Stream<Item = Result<Bytes, IoError>> + Send>>, Bytes>;
+    StreamReader<Pin<Box<dyn futures::Stream<Item = Result<Bytes, IoError>> + Send + Sync>>, Bytes>;
 
 /// A continuously streaming, seekable HTTP reader.
 /// Only on `seek` does it drop the connection and open a new ranged request.
@@ -27,7 +27,7 @@ where
     pub position: u64,
 
     // In-flight response future when opening connection
-    init_fetch: Option<Pin<Box<dyn futures::Future<Output = IoResult<Response>> + Send>>>,
+    init_fetch: Option<Pin<Box<dyn futures::Future<Output = IoResult<Response>> + Send + Sync>>>,
     // Once the response is ready, this yields chunks
     reader: Option<SReader>,
 }

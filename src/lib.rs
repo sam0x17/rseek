@@ -64,7 +64,7 @@ where
         let resp = req
             .send()
             .await
-            .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| IoError::other(e.to_string()))?;
         if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
             // Range not supported
             return Err(IoError::new(
@@ -82,8 +82,7 @@ where
                 }
             }
         }
-        Err(IoError::new(
-            ErrorKind::Other,
+        Err(IoError::other(
             "failed to determine file size",
         ))
     }
@@ -101,7 +100,7 @@ where
             builder
                 .send()
                 .await
-                .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))
+                .map_err(|e| IoError::other(e.to_string()))
         };
         self.init_fetch = Some(Box::pin(fut));
     }
@@ -142,7 +141,7 @@ where
                 Poll::Ready(Ok(resp)) => {
                     let stream = resp
                         .bytes_stream()
-                        .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()));
+                        .map_err(|e| IoError::other(e.to_string()));
                     this.reader = Some(StreamReader::new(Box::pin(stream)));
                     this.init_fetch = None;
                     // Recurse into reader

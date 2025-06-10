@@ -82,9 +82,7 @@ where
                 }
             }
         }
-        Err(IoError::other(
-            "failed to determine file size",
-        ))
+        Err(IoError::other("failed to determine file size"))
     }
 
     fn schedule_fetch(&mut self, pos: u64) {

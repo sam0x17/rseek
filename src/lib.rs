@@ -73,15 +73,12 @@ where
             ));
         }
         // Parse Content-Range header: bytes 0-0/size
-        if let Some(cr) = resp.headers().get("content-range") {
-            if let Ok(s) = cr.to_str() {
-                if let Some(total) = s.split('/').nth(1) {
-                    if let Ok(n) = total.parse::<u64>() {
+        if let Some(cr) = resp.headers().get("content-range")
+            && let Ok(s) = cr.to_str()
+                && let Some(total) = s.split('/').nth(1)
+                    && let Ok(n) = total.parse::<u64>() {
                         return Ok(n);
                     }
-                }
-            }
-        }
         Err(IoError::other("failed to determine file size"))
     }
 
@@ -117,11 +114,10 @@ where
         let this = unsafe { Pin::get_unchecked_mut(self) };
 
         // EOF guard
-        if let Some(sz) = this.file_size {
-            if this.position >= sz {
+        if let Some(sz) = this.file_size
+            && this.position >= sz {
                 return Poll::Ready(Err(IoError::new(ErrorKind::UnexpectedEof, "EOF reached")));
             }
-        }
 
         // Delegate to existing reader
         if let Some(reader) = &mut this.reader {

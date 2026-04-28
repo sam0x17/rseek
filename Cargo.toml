@@ -1,6 +1,6 @@
 [package]
 name = "rseek"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["sam0x17"]
 description = "rseek is an adapter for reqwest that allows seeking in the response body stream using AsyncSeek"
@@ -12,6 +12,6 @@ documentation = "https://docs.rs/rseek/latest/rseek/"
 [dependencies]
 bytes = "1"
 futures = ">= 0.3"
-reqwest = { version = ">= 0.12", features = ["stream"] }
+reqwest = { version = "0.13", features = ["stream"] }
 tokio = { version = ">= 1.44", features = ["full"] }
 tokio-util = ">= 0.7"

@@ -37,6 +37,13 @@ async fn main() {
   bounds, relying on the server to handle the request appropriately.
 
 ## Errors
+- HTTP 4xx and 5xx responses return an I/O error before their body is exposed as file data.
+  The original `reqwest::Error` is preserved, including its HTTP status. After a failed read,
+  seek to the desired position to issue a new request.
 - Returns `UnexpectedEof` if attempting to read past the end of the file.
 - Returns `InvalidInput` if seeking to a negative position.
 - Returns `Unsupported` if seeking from the end when the file size is unknown.
+
+The constructor's size probe is best-effort: if it fails, `file_size` remains `None`.
+Errors from the subsequent body request are returned by reads. Calling `fetch_file_size`
+directly returns any probe error to the caller.

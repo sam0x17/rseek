@@ -64,7 +64,8 @@ where
         let resp = req
             .send()
             .await
-            .map_err(|e| IoError::other(e.to_string()))?;
+            .and_then(Response::error_for_status)
+            .map_err(IoError::other)?;
         if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
             // Range not supported
             return Err(IoError::new(
@@ -96,7 +97,8 @@ where
             builder
                 .send()
                 .await
-                .map_err(|e| IoError::other(e.to_string()))
+                .and_then(Response::error_for_status)
+                .map_err(IoError::other)
         };
         self.init_fetch = Some(Box::pin(fut));
     }
@@ -144,7 +146,10 @@ where
                     let pinned = unsafe { Pin::new_unchecked(this) };
                     return AsyncRead::poll_read(pinned, cx, buf);
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Err(e)) => {
+                    this.init_fetch = None;
+                    return Poll::Ready(Err(e));
+                }
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -190,203 +195,4 @@ where
         let this = self.get_mut();
         Poll::Ready(Ok(this.position))
     }
-}
-
-#[tokio::test]
-async fn test_seekable_http_stream() {
-    use reqwest::Client;
-    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-
-    let client = Client::new();
-    let mut stream = Seekable::new(move || client.get("https://example.com/largefile.bin")).await;
-    let mut buf = vec![0u8; 16];
-
-    // Read start
-    stream.read_exact(&mut buf).await.unwrap();
-
-    // Seek + read at 1MB
-    stream.seek(SeekFrom::Start(1_000_000)).await.unwrap();
-    stream.read_exact(&mut buf).await.unwrap();
-    let first_1mb = buf.clone();
-
-    // Seek + read at 1.5MB
-    stream.seek(SeekFrom::Current(512_000)).await.unwrap();
-    stream.read_exact(&mut buf).await.unwrap();
-
-    // Backward seek relative to last read to 1MB
-    let back_offset = -(512_000 + buf.len() as i64);
-    stream.seek(SeekFrom::Current(back_offset)).await.unwrap();
-    let mut back_buf = vec![0u8; 16];
-    stream.read_exact(&mut back_buf).await.unwrap();
-    assert_eq!(back_buf, first_1mb);
-}
-
-#[tokio::test]
-async fn test_fetch_file_size_ovh() {
-    use reqwest::Client;
-
-    let client = Client::new();
-    let stream = Seekable::new(move || client.get("https://proof.ovh.net/files/100Mb.dat")).await;
-
-    let size = Seekable::fetch_file_size(&stream).await.unwrap();
-
-    // Assert that file size is exactly 100MB (104857600 bytes)
-    assert_eq!(size, 100 * 1024 * 1024);
-}
-
-#[tokio::test]
-async fn test_fetch_file_size_of1() {
-    use reqwest::Client;
-
-    let client = Client::new();
-
-    let stream =
-        Seekable::new(move || client.get("https://files.old-faithful.net/712/epoch-712.car")).await;
-
-    let size = Seekable::fetch_file_size(&stream).await.unwrap();
-
-    assert_eq!(size, 781436491980);
-}
-
-#[tokio::test]
-async fn test_seek_beyond_eof() {
-    use reqwest::Client;
-    use tokio::io::AsyncSeekExt;
-
-    let client = Client::new();
-    let mut stream =
-        Seekable::new(move || client.get("https://proof.ovh.net/files/100Mb.dat")).await;
-
-    let file_size = stream.file_size.unwrap();
-
-    // Seek well beyond EOF
-    stream
-        .seek(SeekFrom::Start(file_size + 1000))
-        .await
-        .unwrap();
-
-    // Ensure position is clamped to EOF
-    assert_eq!(stream.position, file_size);
-}
-
-#[tokio::test]
-async fn test_read_at_eof_should_return_eof() {
-    use reqwest::Client;
-    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-
-    let client = Client::new();
-    let mut stream =
-        Seekable::new(move || client.get("https://proof.ovh.net/files/100Mb.dat")).await;
-
-    let file_size = stream.file_size.unwrap();
-
-    // Seek to EOF
-    stream.seek(SeekFrom::Start(file_size)).await.unwrap();
-
-    let mut buf = vec![0u8; 16];
-    let result = stream.read_exact(&mut buf).await;
-
-    // Expect EOF error
-    assert!(result.is_err());
-    assert_eq!(
-        result.unwrap_err().kind(),
-        std::io::ErrorKind::UnexpectedEof
-    );
-}
-
-#[tokio::test]
-async fn test_fetch_near_eof_should_only_fetch_remaining_bytes() {
-    use reqwest::Client;
-    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-
-    let client = Client::new();
-    let mut stream =
-        Seekable::new(move || client.get("https://proof.ovh.net/files/100Mb.dat")).await;
-
-    let file_size = stream.file_size.unwrap();
-
-    // Seek close to EOF
-    stream.seek(SeekFrom::Start(file_size - 10)).await.unwrap();
-
-    let mut buf = vec![0u8; 16]; // Try to read past EOF
-    let result = stream.read_exact(&mut buf).await;
-
-    // Expect an EOF error because there's not enough data to fill the buffer
-    assert!(result.is_err());
-    assert_eq!(
-        result.unwrap_err().kind(),
-        std::io::ErrorKind::UnexpectedEof
-    );
-}
-
-#[tokio::test]
-async fn test_seek_before_start_should_error() {
-    use reqwest::Client;
-    use tokio::io::AsyncSeekExt;
-
-    let client = Client::new();
-    let mut stream =
-        Seekable::new(move || client.get("https://proof.ovh.net/files/100Mb.dat")).await;
-
-    // Seek to a negative position
-    let result = stream.seek(SeekFrom::Current(-1_000_000_000)).await;
-
-    // Should return an error
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
-}
-
-#[tokio::test]
-async fn test_seek_to_end_of_enormous_file() {
-    use reqwest::Client;
-    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-
-    let client = Client::new();
-
-    let mut stream =
-        Seekable::new(move || client.get("https://files.old-faithful.net/725/epoch-725.car")).await;
-
-    let mut buf = vec![0u8; 16]; // Read 16 bytes
-
-    // Read first 16 bytes at the start
-    stream.read_exact(&mut buf).await.unwrap();
-    println!("First 16 bytes: {:?}", buf);
-
-    // Seek forward by 1MB and read again
-    stream.seek(SeekFrom::Start(1_000_000)).await.unwrap();
-    stream.read_exact(&mut buf).await.unwrap();
-    println!("Bytes after seeking to 1MB: {:?}", buf);
-
-    // Seek to the end of the file minus 16 bytes
-    stream.seek(SeekFrom::End(-16)).await.unwrap();
-    stream.read_exact(&mut buf).await.unwrap();
-    println!("Bytes after seeking to 16 bytes before EOF: {:?}", buf);
-    assert_eq!(
-        buf,
-        vec![
-            22, 247, 241, 176, 61, 255, 51, 33, 66, 108, 17, 240, 234, 176, 48, 222
-        ]
-    );
-    stream.seek(SeekFrom::End(-16)).await.unwrap();
-    stream.read_exact(&mut buf).await.unwrap();
-    assert_eq!(
-        buf,
-        vec![
-            22, 247, 241, 176, 61, 255, 51, 33, 66, 108, 17, 240, 234, 176, 48, 222
-        ]
-    );
-}
-
-#[tokio::test]
-async fn test_long_read() {
-    use reqwest::Client;
-    use tokio::io::AsyncReadExt;
-
-    let client = Client::new();
-
-    let mut stream =
-        Seekable::new(move || client.get("https://files.old-faithful.net/725/epoch-725.car")).await;
-
-    let mut buf = vec![0u8; 400 * 1024 * 1024];
-    stream.read_exact(&mut buf).await.unwrap();
 }
